@@ -1,0 +1,12 @@
+# secrets and per-machine state
+config.json
+apps_script/Secret.js
+apps_script/.clasp.json
+.yt_profile/
+tracker/.wrangler/
+.env*
+
+# generated
+logs/
+__pycache__/
+*.pyc
