@@ -56,6 +56,9 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
 - `python outreach.py status`: counts, the latest 25 leads (status, step, watched, next send in HKT, reply snippet) and A/B stats. Summarize briefly for Telegram.
 - `python outreach.py stop EMAIL`: stop follow-ups for one prospect, for example when they replied somewhere else.
 - `python outreach.py send <lead.json> --test THEIR_OWN_EMAIL`: send the first email to the user right away to check how it looks. There are no follow-ups and it's excluded from stats.
+- **Correcting the after-reply phase:** when the user says "booked X", "close X", "resume X" or "keep following up X", run
+  `python -c "import outreach,json; print(json.dumps(outreach.call({'action':'set_status','email':'X','status':'booked'})))"`
+  with `status` set to `booked` / `closed` / `booking` (call follow-ups) / `active` (the original sequence). The reply wording rules live in `HARD_STOP`, `DECLINE`, `USER_BOOKED` and `USER_CLOSE` in `Code.js`; test changes with `node test\intent_test.js`.
 - `python outreach.py run`: process due sends and reply checks now, instead of waiting for the hourly run.
 
 ## Statuses (Leads tab)
@@ -64,7 +67,10 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
 |---|---|
 | `scheduled` | The first email is waiting for 9am their time. |
 | `active` | In the follow-up sequence. |
-| `replied` | They replied. The sequence stopped and the user handles the conversation. |
+| `replied` | They replied. Follow-ups are paused while waiting for the user to answer. A Telegram reminder goes out after `REPLY_REMINDER_HOURS`. |
+| `booking` | The user answered and the prospect went quiet. Call-booking follow-ups (Templates kind `booking`) go out every `BOOKING_GAP_DAYS`, up to `MAX_BOOKING_FOLLOWUPS`, in the same thread. A new reply from them puts the lead back to `replied`. |
+| `booked` | The user's reply looks like a confirmed call ("see you Thursday", "sent an invite"). No more emails. |
+| `closed` | No more emails. Either they declined and the user replied, the user's reply closed it ("when the time is right", "all the best"), or they asked to unsubscribe or stop, which closes it immediately. |
 | `bounced` | The email bounced. |
 | `finished` | All 10 follow-ups were sent. Replies are still watched for 21 days, then it becomes `done`. |
 | `stopped` | Stopped manually. |

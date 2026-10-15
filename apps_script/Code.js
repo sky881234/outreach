@@ -5,7 +5,8 @@ const SHEETS = {
   Leads: ['lead_id', 'added_at', 'status', 'email', 'first_name', 'company', 'channel_url', 'topic', 'hook',
     'touches', 'tz', 'video_url', 'video_id', 'thumb_file_id', 'initial_template', 'subject', 'thread_id',
     'rfc_msg_id', 'step', 'first_sent_at', 'last_sent_at', 'next_send_at', 'next_send_local', 'last_template',
-    'last_touch', 'views_baseline', 'views', 'seen', 'replied_at', 'reply_snippet', 'errors', 'last_error', 'notes', 'opens', 'clicks', 'opened_at', 'clicked_at'],
+    'last_touch', 'views_baseline', 'views', 'seen', 'replied_at', 'reply_snippet', 'errors', 'last_error', 'notes', 'opens', 'clicks', 'opened_at', 'clicked_at',
+    'last_prospect_at', 'declined', 'booking_step', 'last_msg_id', 'reminded'],
   Templates: ['template_id', 'kind', 'branch', 'subject', 'body', 'active', 'notes'],
   Touches: ['touch_id', 'text', 'active'],
   Events: ['ts', 'lead_id', 'email', 'event', 'step', 'template_id', 'touch_id', 'initial_template', 'detail'],
@@ -19,6 +20,9 @@ const DEFAULT_SETTINGS = [
   ['MAX_SENDS_PER_RUN', 2, 'Engine runs every 10 min; at most this many emails per run, 30-90s apart'],
   ['FOLLOWUP_GAP_DAYS', 2, 'Days between follow-ups'],
   ['MAX_FOLLOWUPS', 10, 'Follow-ups after the first email'],
+  ['BOOKING_GAP_DAYS', 2, 'After you reply to a prospect: days between call-booking follow-ups'],
+  ['MAX_BOOKING_FOLLOWUPS', 10, 'Call-booking follow-ups before giving up'],
+  ['REPLY_REMINDER_HOURS', 24, 'Ping on Telegram if a prospect reply has gone unanswered this long'],
   ['DAILY_SEND_CAP', 60, 'Max emails per 24h (free Gmail hard limit is ~100)'],
   ['SKIP_WEEKENDS', 'FALSE', 'TRUE = never send on Sat/Sun (prospect time)'],
   ['DEFAULT_TZ', 'America/New_York', 'Used when a lead has no timezone'],
@@ -38,13 +42,19 @@ const DEFAULT_TEMPLATES = [
   ['FS1', 'followup', 'seen', '',
     'Noticed you have seen the video!\n\n{touch}\n\nReply and I can send you the download link to test the results.\n\nCordially yours,\nMatthew',
     true, 'Original'],
+  ['B1', 'booking', 'any', '',
+    'Hey {first_name},\n\nJust bumping this up in case it got buried.\n\nWhat time works best for a quick call this week?\n\nCordially yours,\nMatthew',
+    true, 'Call booking: sent after you replied and they went quiet'],
+  ['B2', 'booking', 'any', '',
+    'Hey {first_name},\n\nFollowing up on finding a time to chat.\n\n{touch}\n\nWhich day works better for a quick call?\n\nCordially yours,\nMatthew',
+    true, 'Call booking: sent after you replied and they went quiet'],
 ];
 
 const DEFAULT_TOUCHES = [
   ['T1', 'This solution does not require you to do any extra work to get results.', true],
 ];
 
-const ACTIVE_STATES = ['scheduled', 'active', 'finished'];
+const ACTIVE_STATES = ['scheduled', 'active', 'finished', 'replied', 'booking'];
 const THUMB = '\u0000THUMB\u0000';
 
 // ---------- setup ----------
@@ -101,6 +111,11 @@ function upgrade_() {
   const have = {};
   table_('Settings').rows.forEach(r => { have[r.key] = true; });
   DEFAULT_SETTINGS.filter(r => !have[r[0]]).forEach(r => append_('Settings', { key: r[0], value: r[1], notes: r[2] }));
+  const tplIds = {};
+  table_('Templates').rows.forEach(r => { tplIds[r.template_id] = true; });
+  DEFAULT_TEMPLATES.filter(r => !tplIds[r[0]]).forEach(r => append_('Templates', {
+    template_id: r[0], kind: r[1], branch: r[2], subject: r[3], body: r[4], active: r[5], notes: r[6],
+  }));
   return { ok: true, triggers: ScriptApp.getProjectTriggers().length };
 }
 
@@ -139,6 +154,7 @@ function doPost(e) {
       case 'run': tickInner_(true); return json_({ ok: true, status: statusReport_() });
       case 'upgrade': return json_(upgrade_());
       case 'set_telegram': return json_(setTelegram_(req));
+      case 'set_status': return json_(setStatus_(req));
       case 'set_setting': return json_(setSetting_(req.key, req.value));
       case 'events': return json_({ ok: true, events: table_('Events').rows.slice(-(req.limit || 20)) });
       default: return json_({ ok: false, error: 'unknown action ' + req.action });
@@ -199,6 +215,9 @@ function settings_() {
   s.MAX_SENDS_PER_RUN = Math.max(1, Number(s.MAX_SENDS_PER_RUN));
   s.FOLLOWUP_GAP_DAYS = Number(s.FOLLOWUP_GAP_DAYS);
   s.MAX_FOLLOWUPS = Number(s.MAX_FOLLOWUPS);
+  s.BOOKING_GAP_DAYS = Number(s.BOOKING_GAP_DAYS);
+  s.MAX_BOOKING_FOLLOWUPS = Number(s.MAX_BOOKING_FOLLOWUPS);
+  s.REPLY_REMINDER_HOURS = Number(s.REPLY_REMINDER_HOURS);
   s.DAILY_SEND_CAP = Number(s.DAILY_SEND_CAP);
   s.SKIP_WEEKENDS = String(s.SKIP_WEEKENDS).toUpperCase() === 'TRUE';
   s.PAUSED = String(s.PAUSED).toUpperCase() === 'TRUE';
@@ -444,36 +463,137 @@ function isAuto_(msg) {
     .test(header_(msg, 'Subject'));
 }
 
-const META = ['From', 'Subject', 'Auto-Submitted', 'X-Autoreply', 'X-Autorespond', 'Precedence'];
+const META = ['From', 'Subject', 'Auto-Submitted', 'X-Autoreply', 'X-Autorespond', 'Precedence', 'Message-ID'];
 
-// Returns {kind: 'replied'|'bounced', snippet} or null.
-function checkReply_(lead) {
-  const since = Math.floor(new Date(lead.first_sent_at).getTime() / 1000);
-  const inspect = msg => {
-    if ((msg.labelIds || []).indexOf('SENT') >= 0) return null;
-    const from = header_(msg, 'From').toLowerCase();
-    if (/mailer-daemon|postmaster/.test(from)) return { kind: 'bounced', snippet: msg.snippet };
-    if (isAuto_(msg)) return null;
-    return { kind: 'replied', snippet: msg.snippet };
+// Every message in this conversation after sinceMs, oldest first: the thread, plus searches for replies
+// that started a new thread, unthreaded bounces and (withSent) your own replies.
+function leadMessages_(lead, sinceMs, withSent) {
+  const since = Math.floor(sinceMs / 1000);
+  const got = {};
+  const out = [];
+  const add = msg => {
+    if (got[msg.id]) return;
+    got[msg.id] = true;
+    const ts = Number(msg.internalDate);
+    if (!(ts > sinceMs)) return;
+    out.push({
+      ts, mine: (msg.labelIds || []).indexOf('SENT') >= 0, auto: isAuto_(msg), snippet: unescape_(msg.snippet || ''),
+      bounce: /mailer-daemon|postmaster/.test(header_(msg, 'From').toLowerCase()), rfcId: header_(msg, 'Message-ID'),
+    });
   };
   if (lead.thread_id) {
     const t = Gmail.Users.Threads.get('me', lead.thread_id, { format: 'metadata', metadataHeaders: META });
-    for (const msg of t.messages || []) {
-      const hit = inspect(msg);
-      if (hit) return hit;
-    }
+    (t.messages || []).forEach(add);
   }
-  // Replies that started a new thread, and bounces Gmail didn't thread.
   const queries = ['from:' + lead.email + ' after:' + since,
     'from:(mailer-daemon OR postmaster) after:' + since + ' "' + lead.email + '"'];
+  if (withSent) queries.push('in:sent to:' + lead.email + ' after:' + since);
   for (const q of queries) {
     const list = Gmail.Users.Messages.list('me', { q, maxResults: 5 });
     for (const m of list.messages || []) {
-      const hit = inspect(Gmail.Users.Messages.get('me', m.id, { format: 'metadata', metadataHeaders: META }));
-      if (hit) return hit;
+      if (!got[m.id]) add(Gmail.Users.Messages.get('me', m.id, { format: 'metadata', metadataHeaders: META }));
     }
   }
-  return null;
+  return out.sort((a, b) => a.ts - b.ts);
+}
+
+// Reply wording. Hard stops close immediately; a decline closes once you've replied.
+const HARD_STOP = /\b(unsubscribe|remove me|take me off|stop (emailing|contacting|sending)|do not (email|contact)|don'?t (email|contact))\b/i;
+const DECLINE = /\b(not interested|no thanks|no,? thank you|not a (good )?fit|not for (us|me)|we('| a)re (all )?(good|set)|pass on (this|it)|not at this time|not right now|no need|(do not|don'?t) need|not looking)\b/i;
+const USER_BOOKED = /(see you (on|then|at|tomorrow|next)|talk (to you )?(then|on|tomorrow)|speak (to you )?(then|on|tomorrow)|calendar invite|sent (you )?(an |the )?invite|invite (sent|is on)|(call|meeting) is (booked|confirmed|set)|booked (you|it|us) in|locked (it )?in|confirmed for)/i;
+const USER_CLOSE = /(when the time is right|whenever you('| a)re ready|feel free to reach out|reach out (any ?time|whenever)|door is (always )?open|best of luck|all the best|wish you (all )?the best)/i;
+
+// Gmail snippets arrive HTML-escaped ("don&#39;t").
+function unescape_(s) {
+  return s.replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+function prospectIntent_(text) {
+  if (HARD_STOP.test(text)) return 'stop';
+  if (DECLINE.test(text)) return 'decline';
+  return 'reply';
+}
+
+function didReply_(l) {
+  return !!l.replied_at && l.status !== 'bounced';
+}
+
+function threadLink_(lead) {
+  return 'https://mail.google.com/mail/u/0/#all/' + lead.thread_id;
+}
+
+function handleProspectMsg_(lead, msg, s, now) {
+  const who = (lead.first_name || '') + ' (' + lead.company + ', ' + lead.email + ')';
+  const step = lead.status === 'booking' ? 100 + Number(lead.booking_step || 0) : lead.step;
+  if (msg.bounce) {
+    update_('Leads', lead._row, { status: 'bounced', replied_at: now, reply_snippet: msg.snippet, next_send_at: '', next_send_local: '' });
+    logEvent_(lead, 'bounced', { step, template_id: lead.last_template, detail: msg.snippet });
+    return;
+  }
+  const intent = prospectIntent_(msg.snippet);
+  const after = lead.status === 'booking' ? 'After call follow-up #' + lead.booking_step
+    : lead.status === 'replied' ? 'Another message'
+      : Number(lead.step) ? 'After follow-up #' + lead.step : 'After the first email';
+  const status = intent === 'stop' ? 'closed' : 'replied';
+  update_('Leads', lead._row, {
+    status, replied_at: now, reply_snippet: msg.snippet, last_prospect_at: new Date(msg.ts),
+    declined: intent !== 'reply', reminded: false, next_send_at: '', next_send_local: '',
+  });
+  logEvent_(lead, 'replied', { step, template_id: lead.last_template, touch_id: lead.last_touch, detail: msg.snippet });
+  if (status === 'closed') logEvent_(lead, 'closed', { step, detail: 'asked not to be contacted' });
+  const next = intent === 'stop' ? 'They asked not to be contacted. Closed: no more emails.'
+    : intent === 'decline' ? 'Looks like a no. Once you reply, it closes: no more follow-ups.'
+      : 'Follow-ups paused. Once you reply, I keep following up every ' + s.BOOKING_GAP_DAYS +
+        ' days until they answer, to get the call booked.';
+  notify_(s, '📩 Reply from ' + who + ':\n\n"' + msg.snippet + '"\n\n' + after +
+    (isTrue_(lead.seen) ? ', watched the video' : '') + '.\n' + next + '\n' + threadLink_(lead));
+}
+
+// You answered a prospect: book-a-call follow-ups, unless it's settled (call booked, or they declined).
+function handleUserReply_(lead, msg, s, now) {
+  const who = (lead.first_name || '') + ' (' + lead.company + ')';
+  const tz = lead.tz || s.DEFAULT_TZ;
+  if (USER_BOOKED.test(msg.snippet)) {
+    update_('Leads', lead._row, { status: 'booked', next_send_at: '', next_send_local: '' });
+    logEvent_(lead, 'booked', { detail: msg.snippet });
+    notify_(s, '📅 ' + who + ': looks like the call is booked. No more follow-ups.\nWrong? Tell Claude "resume ' +
+      lead.email + '".');
+  } else if (isTrue_(lead.declined) || USER_CLOSE.test(msg.snippet)) {
+    update_('Leads', lead._row, { status: 'closed', next_send_at: '', next_send_local: '' });
+    logEvent_(lead, 'closed', { detail: msg.snippet });
+    notify_(s, '🤝 ' + who + ': closed after your reply. No more follow-ups.\nWrong? Tell Claude "resume ' +
+      lead.email + '".');
+  } else {
+    const next = slot_(now, s.BOOKING_GAP_DAYS, tz, s);
+    update_('Leads', lead._row, {
+      status: 'booking', booking_step: 0, last_msg_id: msg.rfcId, next_send_at: next, next_send_local: fmtLocal_(next, tz),
+    });
+    logEvent_(lead, 'booking_started', { detail: msg.snippet });
+    notify_(s, '📞 ' + who + ': you replied. If they go quiet, call-booking follow-ups go out every ' +
+      s.BOOKING_GAP_DAYS + ' days (first: ' + fmtLocal_(next, 'Asia/Hong_Kong') + ').\nAlready booked or a no? Tell Claude "booked ' +
+      lead.email + '" or "close ' + lead.email + '".');
+  }
+}
+
+function sendBooking_(lead, s) {
+  const bstep = Number(lead.booking_step || 0) + 1;
+  const step = 100 + bstep;
+  const tpl = pickTemplate_('booking', 'any', null);
+  const touch = pickTouch_(lead, 0);
+  const r = render_(tpl, lead, touch.text, trackLinks_(lead, step, s));
+  const subject = /^re:/i.test(lead.subject) ? lead.subject : 'Re: ' + lead.subject;
+  const res = send_(lead, r, subject, lead.thread_id, lead.last_msg_id || lead.rfc_msg_id);
+  const now = new Date();
+  const tz = lead.tz || s.DEFAULT_TZ;
+  const done = bstep >= s.MAX_BOOKING_FOLLOWUPS;
+  const next = done ? '' : slot_(now, s.BOOKING_GAP_DAYS, tz, s);
+  Object.assign(lead, {
+    status: done ? 'finished' : 'booking', booking_step: bstep, last_sent_at: now, next_send_at: next,
+    next_send_local: next ? fmtLocal_(next, tz) : '', last_template: tpl.template_id, last_touch: touch.touch_id,
+    last_msg_id: res.rfcId || lead.last_msg_id, errors: 0, last_error: '',
+  });
+  update_('Leads', lead._row, lead);
+  logEvent_(lead, 'sent', { step, template_id: tpl.template_id, touch_id: touch.touch_id, detail: 'booking' });
 }
 
 function videoId_(url) {
@@ -531,23 +651,30 @@ function tickInner_(forceCheck) {
         Object.assign(lead, patch);
         update_('Leads', lead._row, patch);
       }
-      if (lead.status === 'active' || lead.status === 'finished') {
+      if (['active', 'finished', 'replied', 'booking'].indexOf(lead.status) >= 0) {
         if (lead.status === 'finished' && now - new Date(lead.last_sent_at) > 21 * 864e5) {
           update_('Leads', lead._row, { status: 'done' });
           continue;
         }
-        if (!fullCheck && !(lead.status === 'active' && due)) continue;
-        const hit = checkReply_(lead);
-        if (hit) {
-          update_('Leads', lead._row, {
-            status: hit.kind, replied_at: now, reply_snippet: hit.snippet, next_send_at: '', next_send_local: '',
-          });
-          logEvent_(lead, hit.kind, { template_id: lead.last_template, touch_id: lead.last_touch, detail: hit.snippet });
-          if (hit.kind === 'replied') {
-            notify_(s, '📩 Reply from ' + (lead.first_name || '') + ' (' + lead.company + ', ' + lead.email + '):\n\n"' +
-              hit.snippet + '"\n\n' + (Number(lead.step) ? 'After follow-up #' + lead.step : 'After the first email') +
-              (isTrue_(lead.seen) ? ', watched the video' : '') + '. Follow-ups stopped.\n' +
-              'https://mail.google.com/mail/u/0/#all/' + lead.thread_id);
+        const sending = (lead.status === 'active' || lead.status === 'booking') && due;
+        if (!fullCheck && !sending) continue;
+        // Only messages newer than the prospect's last known message count.
+        const since = new Date(lead.last_prospect_at || (lead.status === 'replied' ? lead.replied_at : '') ||
+          lead.first_sent_at).getTime();
+        const msgs = leadMessages_(lead, since, lead.status === 'replied');
+        const theirs = msgs.filter(m => !m.mine && !m.auto);
+        if (theirs.length) {
+          handleProspectMsg_(lead, theirs[theirs.length - 1], s, now);
+          continue;
+        }
+        if (lead.status === 'replied') {
+          const mine = msgs.filter(m => m.mine);
+          if (mine.length) {
+            handleUserReply_(lead, mine[mine.length - 1], s, now);
+          } else if (!isTrue_(lead.reminded) && now - new Date(lead.replied_at) > s.REPLY_REMINDER_HOURS * 3600e3) {
+            update_('Leads', lead._row, { reminded: true });
+            notify_(s, '⏰ ' + (lead.first_name || '') + ' (' + lead.company + ') replied ' + s.REPLY_REMINDER_HOURS +
+              'h+ ago and is still waiting on you:\n"' + lead.reply_snippet + '"\n' + threadLink_(lead));
           }
           continue;
         }
@@ -565,9 +692,11 @@ function tickInner_(forceCheck) {
       if (s.PAUSED || budget <= 0 || runBudget <= 0) continue;
       const sendInitial = lead.status === 'test_pending' || (lead.status === 'scheduled' && due);
       const sendFollowup = lead.status === 'active' && due;
-      if (!sendInitial && !sendFollowup) continue;
+      const sendBooking = lead.status === 'booking' && due;
+      if (!sendInitial && !sendFollowup && !sendBooking) continue;
       if (runBudget < s.MAX_SENDS_PER_RUN) Utilities.sleep(30000 + Math.floor(Math.random() * 60000));
       if (sendInitial) sendInitial_(lead, s);
+      else if (sendBooking) sendBooking_(lead, s);
       else sendFollowup_(lead, s);
       budget--;
       runBudget--;
@@ -602,6 +731,26 @@ function notify_(s, text) {
     Logger.log('telegram: ' + e);
     return { ok: false, error: String(e) };
   }
+}
+
+// Manual correction from Claude: booked / closed (stop), booking (call follow-ups), active (resume the sequence).
+function setStatus_(req) {
+  const s = settings_();
+  const key = String(req.email || req.lead_id || '').toLowerCase();
+  const lead = table_('Leads').rows.filter(l =>
+    String(l.email).toLowerCase() === key || String(l.lead_id).toLowerCase() === key).pop();
+  if (!lead) return { ok: false, error: 'lead not found: ' + key };
+  const tz = lead.tz || s.DEFAULT_TZ;
+  const patch = { status: req.status, next_send_at: '', next_send_local: '' };
+  if (req.status === 'booking' || req.status === 'active') {
+    const next = slot_(new Date(), req.status === 'booking' ? s.BOOKING_GAP_DAYS : s.FOLLOWUP_GAP_DAYS, tz, s);
+    Object.assign(patch, { next_send_at: next, next_send_local: fmtLocal_(next, tz), errors: 0 });
+  } else if (['booked', 'closed', 'stopped'].indexOf(req.status) < 0) {
+    return { ok: false, error: 'status must be booked, closed, stopped, booking or active' };
+  }
+  update_('Leads', lead._row, patch);
+  logEvent_(lead, 'status_' + req.status, { detail: req.reason || 'set via Claude' });
+  return { ok: true, email: lead.email, status: req.status, next_send_local: patch.next_send_local };
 }
 
 function setSetting_(key, value) {
@@ -765,7 +914,7 @@ function statsData_() {
     if (first.open) r.opened++;
     if (first.click) r.clicked++;
     if (isTrue_(l.seen)) r.seen++;
-    if (l.status === 'replied') r.replied++;
+    if (didReply_(l)) r.replied++;
     if (l.status === 'bounced') r.bounced++;
   });
 
@@ -801,7 +950,8 @@ function statsData_() {
       opened: pct_(leads.filter(l => Number(l.opens) > 0 || Number(l.clicks) > 0).length, total),
       clicked: pct_(leads.filter(l => Number(l.clicks) > 0).length, total),
       seen: pct_(leads.filter(l => isTrue_(l.seen)).length, total),
-      replied: pct_(count('replied'), total), bounced: pct_(count('bounced'), total),
+      replied: pct_(leads.filter(didReply_).length, total), booked: pct_(count('booked'), total),
+      bounced: pct_(count('bounced'), total),
     },
     initial: Object.keys(initial).map(k => Object.assign({
       template_id: k, subject: tpls[k] ? tpls[k].subject : '',
@@ -825,8 +975,8 @@ function updateStats_() {
   const blocks = [
     ['Updated', new Date()],
     ['Opens are inflated by Apple Mail privacy; judge versions on clicks, watched and replies.'], [],
-    ['TOTALS'], ['Leads emailed', 'Opened', 'Clicked', 'Watched video', 'Replied', 'Bounced'],
-    [t.leads_emailed, t.opened, t.clicked, t.seen, t.replied, t.bounced], [],
+    ['TOTALS'], ['Leads emailed', 'Opened', 'Clicked', 'Watched video', 'Replied', 'Call booked', 'Bounced'],
+    [t.leads_emailed, t.opened, t.clicked, t.seen, t.replied, t.booked, t.bounced], [],
     ['FIRST EMAIL (A/B: subject + body)'],
     ['Template', 'Subject', 'Leads', 'Open %', 'Click %', 'Watched %', 'Reply %', 'Replied', 'Bounced'],
   ];
@@ -865,7 +1015,8 @@ function dashData_(d) {
   const opened = leads.filter(l => Number(l.opens) > 0 || Number(l.clicks) > 0).length;
   const clicked = leads.filter(l => Number(l.clicks) > 0).length;
   const watched = leads.filter(l => isTrue_(l.seen)).length;
-  const replied = leads.filter(l => l.status === 'replied').length;
+  const replied = leads.filter(didReply_).length;
+  const booked = leads.filter(l => l.status === 'booked').length;
   const bounced = leads.filter(l => l.status === 'bounced').length;
 
   // Daily activity (HKT days): emails sent, first opens, first clicks, replies.
@@ -896,14 +1047,18 @@ function dashData_(d) {
   const followups = d.followups.map(r => [r.template_id + ' ' + r.branch + ' (n=' + r.sends + ')',
     frac_(r.clicked, r.sends), frac_(r.replies, r.sends)]);
   const steps = [];
-  const maxStep = Math.max(10, ...Object.keys(d.replies_by_step).map(Number));
+  const stepKeys = Object.keys(d.replies_by_step).map(Number);
+  const maxStep = Math.max(10, ...stepKeys.filter(k => k < 100));
   for (let i = 0; i <= maxStep; i++) steps.push([i === 0 ? 'First' : 'FU ' + i, d.replies_by_step[i] || 0]);
+  steps.push(['Call FUs', stepKeys.filter(k => k >= 100).reduce((a, k) => a + d.replies_by_step[k], 0)]);
 
   return {
     tiles: [['Emailed', n, ''], ['Opened', frac_(opened, n), '%'], ['Clicked', frac_(clicked, n), '%'],
-      ['Watched', frac_(watched, n), '%'], ['Replied', frac_(replied, n), '%'], ['Bounced', frac_(bounced, n), '%']],
+      ['Watched', frac_(watched, n), '%'], ['Replied', frac_(replied, n), '%'], ['Call booked', frac_(booked, n), '%'],
+      ['Bounced', frac_(bounced, n), '%']],
     counts: { n, replied },
-    funnel: [['Emailed', n], ['Opened', opened], ['Clicked', clicked], ['Watched', watched], ['Replied', replied]],
+    funnel: [['Emailed', n], ['Opened', opened], ['Clicked', clicked], ['Watched', watched], ['Replied', replied],
+      ['Call booked', booked]],
     days, initial, followups, steps,
   };
 }
@@ -946,7 +1101,7 @@ function updateDashboard_(d) {
   });
 
   // Rebuild charts only when the data shape changes; otherwise they redraw from ChartData on their own.
-  const shape = 'v2|' + Object.keys(R).map(k => k + R[k].getA1Notation()).join('|');
+  const shape = 'v3|' + Object.keys(R).map(k => k + R[k].getA1Notation()).join('|');
   const props = PropertiesService.getScriptProperties();
   if (props.getProperty('DASH_SHAPE') === shape && dash.getCharts().length) return;
   dash.getCharts().forEach(c => dash.removeChart(c));
