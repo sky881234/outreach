@@ -1,4 +1,4 @@
----
+﻿---
 name: send-outreach
 description: Send the cold outreach email for an approved free-value Short and run the follow-up pipeline. Uploads the final video to YouTube as Unlisted, emails the prospect with the play-button thumbnail linked to it at 9am their time, then the Google Apps Script engine follows up every 2 days (up to 10x) until they reply, choosing the "seen"/"not seen" version by whether the video got views. Use when the user approves a video and says "send it", "send the outreach", "send now", or asks about outreach status, replies, who watched, stopping a prospect, test emails, follow-up templates, or A/B results.
 ---
@@ -7,7 +7,7 @@ description: Send the cold outreach email for an approved free-value Short and r
 
 Everything lives in `C:\Projects\outreach\`. The engine is an Apps Script bound to the **Outreach** Google Sheet (account contactmatthew2200@gmail.com). It runs hourly on Google's servers, so follow-ups go out with the PC off. The local side is `outreach.py`, which calls the engine, and `yt_upload.py`, which drives YouTube Studio.
 
-The user's time zone is HKT. Most prospects are in the US. Emails go out at about 9am in the prospect's time zone, roughly 9–10pm HKT for the US East Coast.
+The user's time zone is HKT. Most prospects are in the US. Emails go out at about 9am in the prospect's time zone, roughly 9â€“10pm HKT for the US East Coast.
 
 ## Sending flow (user says "send it" for an approved video)
 
@@ -35,7 +35,7 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
      "title": "8, 9, 10 capsules of magnesium just to poop?! Gut doctor explains"
    }
    ```
-   - **`topic`**: 1–3 words naming what they sell or do. It fills the subject line "Question About {topic}".
+   - **`topic`**: 1â€“3 words naming what they sell or do. It fills the subject line "Question About {topic}".
    - **`hook`**: one plain sentence in the user's voice, "You want more <the customers or result they want>." Keep it under about 15 words, with no hype or flattery.
    - **`touches`**: the touch point for each follow-up, in order (follow-up 1 uses the first line).
      - Each is one sentence about a different problem they likely have, which this service fixes without extra work from them. Base them on the research about their channel.
@@ -48,7 +48,7 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
    - If `duplicate` is true, say so: this prospect was already emailed.
 5. **Wait for the user's go-ahead.** Skip the preview step only if they explicitly said to send without one.
 6. **Send**: run `python C:\Projects\outreach\outreach.py send <lead.json>`. Add `--now` only if they said "send now".
-   - This uploads the video first (a Chrome window opens on the PC for 1–3 minutes) and saves `video_url` back into lead.json, so a retry never uploads twice.
+   - This uploads the video first (a Chrome window opens on the PC for 1â€“3 minutes) and saves `video_url` back into lead.json, so a retry never uploads twice.
    - Reply with the YouTube link, the send time in HKT and in their time zone, and "follow-ups are automatic until they reply".
 
 ## Other commands (run from `C:\Projects\outreach`)
@@ -56,9 +56,9 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
 - `python outreach.py status`: counts, the latest 25 leads (status, step, watched, next send in HKT, reply snippet) and A/B stats. Summarize briefly for Telegram.
 - `python outreach.py stop EMAIL`: stop follow-ups for one prospect, for example when they replied somewhere else.
 - `python outreach.py send <lead.json> --test THEIR_OWN_EMAIL`: send the first email to the user right away to check how it looks. There are no follow-ups and it's excluded from stats.
-- **Correcting the after-reply phase:** when the user says "booked X", "close X", "resume X" or "keep following up X", run
+- **Correcting after-reply state:** when the user says "booked X", "drop X", "close X" or "resume X", run
   `python -c "import outreach,json; print(json.dumps(outreach.call({'action':'set_status','email':'X','status':'booked'})))"`
-  with `status` set to `booked` / `closed` / `booking` (call follow-ups) / `active` (the original sequence). The reply wording rules live in `HARD_STOP`, `DECLINE`, `USER_BOOKED` and `USER_CLOSE` in `Code.js`; test changes with `node test\intent_test.js`.
+  with `status` set to `booked` / `dropped` / `closed` / `waiting` (check-in pings) / `active` (the original sequence). The reply wording rules (`HARD_STOP`, `DECLINE`) live in `Code.js`; test changes with `node test\intent_test.js`.
 - `python outreach.py run`: process due sends and reply checks now, instead of waiting for the hourly run.
 
 ## Statuses (Leads tab)
@@ -67,10 +67,17 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
 |---|---|
 | `scheduled` | The first email is waiting for 9am their time. |
 | `active` | In the follow-up sequence. |
-| `replied` | They replied. Follow-ups are paused while waiting for the user to answer. A Telegram reminder goes out after `REPLY_REMINDER_HOURS`. |
-| `booking` | The user answered and the prospect went quiet. Call-booking follow-ups (Templates kind `booking`) go out every `BOOKING_GAP_DAYS`, up to `MAX_BOOKING_FOLLOWUPS`, in the same thread. A new reply from them puts the lead back to `replied`. |
-| `booked` | The user's reply looks like a confirmed call ("see you Thursday", "sent an invite"). No more emails. |
-| `closed` | No more emails. Either they declined and the user replied, the user's reply closed it ("when the time is right", "all the best"), or they asked to unsubscribe or stop, which closes it immediately. |
+| `replied` | They replied. Automatic follow-ups stop and the user handles the conversation. A Telegram reminder goes out if it's unanswered after `REPLY_REMINDER_HOURS`. |
+| `waiting` | The user answered and is waiting on them. Nothing is sent automatically. |
+| `booked` / `dropped` | Set from the check-in buttons, or by Claude with `set_status`. No more pings or emails. |
+| `closed` | They asked to unsubscribe or stop. Closed immediately, no more emails. |
+
+**Check-in pings for `waiting` leads:**
+- Every `CHECKIN_PING_DAYS` (2) of quiet, Telegram gets a ping with three buttons: ðŸ“¨ Send follow-up, ðŸ“… Call booked, ðŸ—‘ Drop. Quiet is counted from the user's last email to them or the last ping.
+- **Send follow-up** sends the Templates kind `nudge` email (N1, which includes `{booking_link}` = Settings `BOOKING_LINK`, the Calendly link). It goes now if it's inside their morning window, otherwise at their next morning.
+- The user's own manual emails to the prospect restart the 2-day clock.
+- How a tap reaches the engine: the Telegram bridge (`~/.claude/channels/telegram/bridge.mjs`, `handleOutreachCallback`) receives button data `oc|<op>|<lead_id>` and POSTs `lead_action` to the web app, using `C:\Projects\outreach\config.json`.
+- Buttons only work while the bridge is running.
 | `bounced` | The email bounced. |
 | `finished` | All 10 follow-ups were sent. Replies are still watched for 21 days, then it becomes `done`. |
 | `stopped` | Stopped manually. |
@@ -92,7 +99,7 @@ Out-of-office auto-replies do not stop the sequence.
   - First email: watched % and reply % per template.
   - Follow-ups and touch lines: replies per send. A reply is credited to the last email sent before it.
   - Replies by step.
-- **Settings tab**: `SEND_HOUR_LOCAL`, `FOLLOWUP_GAP_DAYS` (2), `MAX_FOLLOWUPS` (10), `DAILY_SEND_CAP` (60), `SEND_WINDOW_HOURS` (3, random time 9:00–12:00), `MAX_SENDS_PER_RUN` (2), `SKIP_WEEKENDS`, `PAUSED`.
+- **Settings tab**: `SEND_HOUR_LOCAL`, `FOLLOWUP_GAP_DAYS` (2), `MAX_FOLLOWUPS` (10), `DAILY_SEND_CAP` (60), `SEND_WINDOW_HOURS` (3, random time 9:00â€“12:00), `MAX_SENDS_PER_RUN` (2), `SKIP_WEEKENDS`, `PAUSED`.
 - **Telegram reply alerts** are on. They go to the user's Telegram group via the bridge bot. The token and chat ID are stored in Script Properties, not the sheet, and were set with the `set_telegram` web-app action.
 
 **Dashboard tab** (first tab of the sheet): stat tiles plus native Sheets charts.
@@ -125,3 +132,4 @@ To change the engine code: edit `apps_script\Code.js`, then run `powershell -Fil
   - Workaround: the user uploads by hand and sends you the link. Put it in lead.json as `video_url` and run `send` again; the upload is skipped.
 - **`unauthorized` / HTML instead of JSON**: `config.json` and `apps_script\Secret.js` are out of sync, or the deployment changed. Re-run `deploy.ps1`.
 - **Engine-side errors**: check the `last_error` column in the Leads tab and the Events tab.
+

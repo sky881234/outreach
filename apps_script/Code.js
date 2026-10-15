@@ -6,7 +6,7 @@ const SHEETS = {
     'touches', 'tz', 'video_url', 'video_id', 'thumb_file_id', 'initial_template', 'subject', 'thread_id',
     'rfc_msg_id', 'step', 'first_sent_at', 'last_sent_at', 'next_send_at', 'next_send_local', 'last_template',
     'last_touch', 'views_baseline', 'views', 'seen', 'replied_at', 'reply_snippet', 'errors', 'last_error', 'notes', 'opens', 'clicks', 'opened_at', 'clicked_at',
-    'last_prospect_at', 'declined', 'booking_step', 'last_msg_id', 'reminded'],
+    'last_prospect_at', 'declined', 'booking_step', 'last_msg_id', 'reminded', 'last_mine_at', 'last_ping_at', 'nudges'],
   Templates: ['template_id', 'kind', 'branch', 'subject', 'body', 'active', 'notes'],
   Touches: ['touch_id', 'text', 'active'],
   Events: ['ts', 'lead_id', 'email', 'event', 'step', 'template_id', 'touch_id', 'initial_template', 'detail'],
@@ -20,8 +20,8 @@ const DEFAULT_SETTINGS = [
   ['MAX_SENDS_PER_RUN', 2, 'Engine runs every 10 min; at most this many emails per run, 30-90s apart'],
   ['FOLLOWUP_GAP_DAYS', 2, 'Days between follow-ups'],
   ['MAX_FOLLOWUPS', 10, 'Follow-ups after the first email'],
-  ['BOOKING_GAP_DAYS', 2, 'After you reply to a prospect: days between call-booking follow-ups'],
-  ['MAX_BOOKING_FOLLOWUPS', 10, 'Call-booking follow-ups before giving up'],
+  ['CHECKIN_PING_DAYS', 2, 'You replied and they went quiet: Telegram ping with Follow up / Booked / Drop buttons every N days'],
+  ['BOOKING_LINK', 'https://calendly.com/matthew-ch-to/chat', 'Used as {booking_link} in nudge templates'],
   ['REPLY_REMINDER_HOURS', 24, 'Ping on Telegram if a prospect reply has gone unanswered this long'],
   ['DAILY_SEND_CAP', 60, 'Max emails per 24h (free Gmail hard limit is ~100)'],
   ['SKIP_WEEKENDS', 'FALSE', 'TRUE = never send on Sat/Sun (prospect time)'],
@@ -42,19 +42,16 @@ const DEFAULT_TEMPLATES = [
   ['FS1', 'followup', 'seen', '',
     'Noticed you have seen the video!\n\n{touch}\n\nReply and I can send you the download link to test the results.\n\nCordially yours,\nMatthew',
     true, 'Original'],
-  ['B1', 'booking', 'any', '',
-    'Hey {first_name},\n\nJust bumping this up in case it got buried.\n\nWhat time works best for a quick call this week?\n\nCordially yours,\nMatthew',
-    true, 'Call booking: sent after you replied and they went quiet'],
-  ['B2', 'booking', 'any', '',
-    'Hey {first_name},\n\nFollowing up on finding a time to chat.\n\n{touch}\n\nWhich day works better for a quick call?\n\nCordially yours,\nMatthew',
-    true, 'Call booking: sent after you replied and they went quiet'],
+  ['N1', 'nudge', 'any', '',
+    'Hey {first_name},\n\nUnderstand you must be busy,\n\nBut the quick 20 mins call is to understand your situation to see if we\'re a good fit or not.\n\nYou can book a time here:\n{booking_link}\n\nCordially yours,\nMatthew',
+    true, 'Sent when you tap "Send follow-up" on a check-in ping'],
 ];
 
 const DEFAULT_TOUCHES = [
   ['T1', 'This solution does not require you to do any extra work to get results.', true],
 ];
 
-const ACTIVE_STATES = ['scheduled', 'active', 'finished', 'replied', 'booking'];
+const ACTIVE_STATES = ['scheduled', 'active', 'finished', 'replied', 'waiting'];
 const THUMB = '\u0000THUMB\u0000';
 
 // ---------- setup ----------
@@ -111,6 +108,16 @@ function upgrade_() {
   const have = {};
   table_('Settings').rows.forEach(r => { have[r.key] = true; });
   DEFAULT_SETTINGS.filter(r => !have[r[0]]).forEach(r => append_('Settings', { key: r[0], value: r[1], notes: r[2] }));
+  // Retired: automatic call-booking emails (replaced by check-in pings with buttons).
+  table_('Templates').rows.filter(r => r.kind === 'booking').reverse()
+    .forEach(r => ss_().getSheetByName('Templates').deleteRow(r._row));
+  table_('Settings').rows.filter(r => r.key === 'BOOKING_GAP_DAYS' || r.key === 'MAX_BOOKING_FOLLOWUPS').reverse()
+    .forEach(r => ss_().getSheetByName('Settings').deleteRow(r._row));
+  const evs = table_('Events').rows;
+  table_('Leads').rows.filter(l => l.status === 'booking').forEach(l => {
+    const started = evs.filter(e => e.lead_id === l.lead_id && e.event === 'booking_started').pop();
+    update_('Leads', l._row, { status: 'waiting', last_mine_at: started ? started.ts : new Date(), next_send_at: '', next_send_local: '' });
+  });
   const tplIds = {};
   table_('Templates').rows.forEach(r => { tplIds[r.template_id] = true; });
   DEFAULT_TEMPLATES.filter(r => !tplIds[r[0]]).forEach(r => append_('Templates', {
@@ -136,6 +143,8 @@ function doPost(e) {
   }
   if (req.secret !== SECRET) return json_({ ok: false, error: 'unauthorized' });
   // Tracking hits only append to Events (atomic), so they skip the lock and never wait on a send run.
+  // Button taps from Telegram: no lock, so a tap never waits behind a send run.
+  if (req.action === 'lead_action') return json_(leadAction_(req));
   if (req.action === 'track') {
     append_('Events', {
       ts: new Date(), lead_id: req.lead_id, event: req.kind === 'click' ? 'click' : 'open', step: req.step,
@@ -155,6 +164,11 @@ function doPost(e) {
       case 'upgrade': return json_(upgrade_());
       case 'set_telegram': return json_(setTelegram_(req));
       case 'set_status': return json_(setStatus_(req));
+      case 'test_checkin': {
+        const l = table_('Leads').rows.find(x => x.lead_id === req.lead_id);
+        return json_(l ? notify_(settings_(), '🧪 Test check-in ping for ' + (l.first_name || l.company) +
+          ' (status: ' + l.status + '). Tapping a button here changes nothing.', checkinButtons_(l)) : { ok: false, error: 'no lead' });
+      }
       case 'set_setting': return json_(setSetting_(req.key, req.value));
       case 'events': return json_({ ok: true, events: table_('Events').rows.slice(-(req.limit || 20)) });
       default: return json_({ ok: false, error: 'unknown action ' + req.action });
@@ -215,8 +229,7 @@ function settings_() {
   s.MAX_SENDS_PER_RUN = Math.max(1, Number(s.MAX_SENDS_PER_RUN));
   s.FOLLOWUP_GAP_DAYS = Number(s.FOLLOWUP_GAP_DAYS);
   s.MAX_FOLLOWUPS = Number(s.MAX_FOLLOWUPS);
-  s.BOOKING_GAP_DAYS = Number(s.BOOKING_GAP_DAYS);
-  s.MAX_BOOKING_FOLLOWUPS = Number(s.MAX_BOOKING_FOLLOWUPS);
+  s.CHECKIN_PING_DAYS = Number(s.CHECKIN_PING_DAYS);
   s.REPLY_REMINDER_HOURS = Number(s.REPLY_REMINDER_HOURS);
   s.DAILY_SEND_CAP = Number(s.DAILY_SEND_CAP);
   s.SKIP_WEEKENDS = String(s.SKIP_WEEKENDS).toUpperCase() === 'TRUE';
@@ -327,11 +340,16 @@ function pickTouch_(lead, step) {
 function fill_(str, lead, touch) {
   const vars = {
     first_name: lead.first_name, company: lead.company, topic: lead.topic, hook: lead.hook,
-    touch: touch || '', video_url: lead.video_url,
+    touch: touch || '', video_url: lead.video_url, booking_link: lead.booking_link || '',
   };
   return String(str || '')
     .replace(/\{thumbnail\}/g, THUMB)
     .replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k] || '') : m));
+}
+
+// Escape, then make bare URLs clickable (e.g. the booking link).
+function linkify_(s) {
+  return esc_(s).replace(/https?:\/\/[^\s<]+/g, u => '<a href="' + u + '">' + u + '</a>');
 }
 
 function esc_(s) {
@@ -347,7 +365,7 @@ function render_(tpl, lead, touch, track) {
     'style="display:block;width:180px;max-width:100%;border:0"></a>';
   const pixel = track ? '<img src="' + track.pixel + '" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0">' : '';
   const html = '<div dir="ltr">' + body.split('\n').map(line =>
-    line.indexOf(THUMB) >= 0 ? line.split(THUMB).map(esc_).join(img) : esc_(line)).join('<br>') + pixel + '</div>';
+    line.indexOf(THUMB) >= 0 ? line.split(THUMB).map(linkify_).join(img) : linkify_(line)).join('<br>') + pixel + '</div>';
   return { subject: fill_(tpl.subject, lead, touch), text, html, hasThumb: body.indexOf(THUMB) >= 0 };
 }
 
@@ -497,11 +515,9 @@ function leadMessages_(lead, sinceMs, withSent) {
   return out.sort((a, b) => a.ts - b.ts);
 }
 
-// Reply wording. Hard stops close immediately; a decline closes once you've replied.
+// Reply wording: an unsubscribe-style reply closes the lead at once; a likely "no" is flagged in the ping.
 const HARD_STOP = /\b(unsubscribe|remove me|take me off|stop (emailing|contacting|sending)|do not (email|contact)|don'?t (email|contact))\b/i;
 const DECLINE = /\b(not interested|no thanks|no,? thank you|not a (good )?fit|not for (us|me)|we('| a)re (all )?(good|set)|pass on (this|it)|not at this time|not right now|no need|(do not|don'?t) need|not looking)\b/i;
-const USER_BOOKED = /(see you (on|then|at|tomorrow|next)|talk (to you )?(then|on|tomorrow)|speak (to you )?(then|on|tomorrow)|calendar invite|sent (you )?(an |the )?invite|invite (sent|is on)|(call|meeting) is (booked|confirmed|set)|booked (you|it|us) in|locked (it )?in|confirmed for)/i;
-const USER_CLOSE = /(when the time is right|whenever you('| a)re ready|feel free to reach out|reach out (any ?time|whenever)|door is (always )?open|best of luck|all the best|wish you (all )?the best)/i;
 
 // Gmail snippets arrive HTML-escaped ("don&#39;t").
 function unescape_(s) {
@@ -524,14 +540,14 @@ function threadLink_(lead) {
 
 function handleProspectMsg_(lead, msg, s, now) {
   const who = (lead.first_name || '') + ' (' + lead.company + ', ' + lead.email + ')';
-  const step = lead.status === 'booking' ? 100 + Number(lead.booking_step || 0) : lead.step;
+  const step = lead.status === 'waiting' ? 200 + Number(lead.nudges || 0) : lead.step;
   if (msg.bounce) {
     update_('Leads', lead._row, { status: 'bounced', replied_at: now, reply_snippet: msg.snippet, next_send_at: '', next_send_local: '' });
     logEvent_(lead, 'bounced', { step, template_id: lead.last_template, detail: msg.snippet });
     return;
   }
   const intent = prospectIntent_(msg.snippet);
-  const after = lead.status === 'booking' ? 'After call follow-up #' + lead.booking_step
+  const after = lead.status === 'waiting' ? (Number(lead.nudges) ? 'After your follow-up #' + lead.nudges : 'After your reply')
     : lead.status === 'replied' ? 'Another message'
       : Number(lead.step) ? 'After follow-up #' + lead.step : 'After the first email';
   const status = intent === 'stop' ? 'closed' : 'replied';
@@ -542,58 +558,79 @@ function handleProspectMsg_(lead, msg, s, now) {
   logEvent_(lead, 'replied', { step, template_id: lead.last_template, touch_id: lead.last_touch, detail: msg.snippet });
   if (status === 'closed') logEvent_(lead, 'closed', { step, detail: 'asked not to be contacted' });
   const next = intent === 'stop' ? 'They asked not to be contacted. Closed: no more emails.'
-    : intent === 'decline' ? 'Looks like a no. Once you reply, it closes: no more follow-ups.'
-      : 'Follow-ups paused. Once you reply, I keep following up every ' + s.BOOKING_GAP_DAYS +
-        ' days until they answer, to get the call booked.';
+    : (intent === 'decline' ? 'Looks like a no. ' : '') + 'Automatic follow-ups stopped. Over to you.';
   notify_(s, '📩 Reply from ' + who + ':\n\n"' + msg.snippet + '"\n\n' + after +
     (isTrue_(lead.seen) ? ', watched the video' : '') + '.\n' + next + '\n' + threadLink_(lead));
 }
 
-// You answered a prospect: book-a-call follow-ups, unless it's settled (call booked, or they declined).
-function handleUserReply_(lead, msg, s, now) {
-  const who = (lead.first_name || '') + ' (' + lead.company + ')';
-  const tz = lead.tz || s.DEFAULT_TZ;
-  if (USER_BOOKED.test(msg.snippet)) {
-    update_('Leads', lead._row, { status: 'booked', next_send_at: '', next_send_local: '' });
-    logEvent_(lead, 'booked', { detail: msg.snippet });
-    notify_(s, '📅 ' + who + ': looks like the call is booked. No more follow-ups.\nWrong? Tell Claude "resume ' +
-      lead.email + '".');
-  } else if (isTrue_(lead.declined) || USER_CLOSE.test(msg.snippet)) {
-    update_('Leads', lead._row, { status: 'closed', next_send_at: '', next_send_local: '' });
-    logEvent_(lead, 'closed', { detail: msg.snippet });
-    notify_(s, '🤝 ' + who + ': closed after your reply. No more follow-ups.\nWrong? Tell Claude "resume ' +
-      lead.email + '".');
-  } else {
-    const next = slot_(now, s.BOOKING_GAP_DAYS, tz, s);
-    update_('Leads', lead._row, {
-      status: 'booking', booking_step: 0, last_msg_id: msg.rfcId, next_send_at: next, next_send_local: fmtLocal_(next, tz),
-    });
-    logEvent_(lead, 'booking_started', { detail: msg.snippet });
-    notify_(s, '📞 ' + who + ': you replied. If they go quiet, call-booking follow-ups go out every ' +
-      s.BOOKING_GAP_DAYS + ' days (first: ' + fmtLocal_(next, 'Asia/Hong_Kong') + ').\nAlready booked or a no? Tell Claude "booked ' +
-      lead.email + '" or "close ' + lead.email + '".');
-  }
+// You answered them: wait for their reply, with a check-in ping every CHECKIN_PING_DAYS.
+function handleUserReply_(lead, msg) {
+  update_('Leads', lead._row, {
+    status: 'waiting', last_mine_at: new Date(msg.ts), last_msg_id: msg.rfcId, next_send_at: '', next_send_local: '',
+  });
+  logEvent_(lead, 'you_replied', { detail: msg.snippet });
 }
 
-function sendBooking_(lead, s) {
-  const bstep = Number(lead.booking_step || 0) + 1;
-  const step = 100 + bstep;
-  const tpl = pickTemplate_('booking', 'any', null);
-  const touch = pickTouch_(lead, 0);
-  const r = render_(tpl, lead, touch.text, trackLinks_(lead, step, s));
+function checkinButtons_(lead) {
+  return { inline_keyboard: [[
+    { text: '📨 Send follow-up', callback_data: 'oc|nudge|' + lead.lead_id },
+    { text: '📅 Call booked', callback_data: 'oc|booked|' + lead.lead_id },
+    { text: '🗑 Drop', callback_data: 'oc|drop|' + lead.lead_id },
+  ]] };
+}
+
+function sendCheckin_(lead, s, now) {
+  const days = Math.floor((now - new Date(lead.last_mine_at)) / 864e5);
+  notify_(s, '⏳ ' + (lead.first_name || '') + ' (' + lead.company + ') hasn\'t replied in ' + days + ' days.\n\n' +
+    'They said: "' + lead.reply_snippet + '"\n\n' +
+    (Number(lead.nudges) ? 'Follow-ups sent so far: ' + lead.nudges + '\n' : '') + threadLink_(lead),
+  checkinButtons_(lead));
+  update_('Leads', lead._row, { last_ping_at: now });
+  logEvent_(lead, 'checkin_ping', { detail: days + ' days quiet' });
+}
+
+function sendNudge_(lead, s) {
+  const n = Number(lead.nudges || 0) + 1;
+  const step = 200 + n;
+  const tpl = pickTemplate_('nudge', 'any', null);
+  lead.booking_link = s.BOOKING_LINK;
+  const r = render_(tpl, lead, '', trackLinks_(lead, step, s));
   const subject = /^re:/i.test(lead.subject) ? lead.subject : 'Re: ' + lead.subject;
   const res = send_(lead, r, subject, lead.thread_id, lead.last_msg_id || lead.rfc_msg_id);
   const now = new Date();
-  const tz = lead.tz || s.DEFAULT_TZ;
-  const done = bstep >= s.MAX_BOOKING_FOLLOWUPS;
-  const next = done ? '' : slot_(now, s.BOOKING_GAP_DAYS, tz, s);
   Object.assign(lead, {
-    status: done ? 'finished' : 'booking', booking_step: bstep, last_sent_at: now, next_send_at: next,
-    next_send_local: next ? fmtLocal_(next, tz) : '', last_template: tpl.template_id, last_touch: touch.touch_id,
-    last_msg_id: res.rfcId || lead.last_msg_id, errors: 0, last_error: '',
+    nudges: n, last_sent_at: now, last_mine_at: now, next_send_at: '', next_send_local: '',
+    last_template: tpl.template_id, last_touch: '', last_msg_id: res.rfcId || lead.last_msg_id, errors: 0, last_error: '',
   });
   update_('Leads', lead._row, lead);
-  logEvent_(lead, 'sent', { step, template_id: tpl.template_id, touch_id: touch.touch_id, detail: 'booking' });
+  logEvent_(lead, 'sent', { step, template_id: tpl.template_id, detail: 'nudge' });
+}
+
+// Telegram button taps (forwarded by the bridge): nudge / booked / drop.
+function leadAction_(req) {
+  const s = settings_();
+  const lead = table_('Leads').rows.find(l => l.lead_id === req.lead_id);
+  if (!lead) return { ok: false, error: 'lead not found' };
+  const who = lead.first_name || lead.company;
+  if (lead.status !== 'waiting' && lead.status !== 'replied') {
+    return { ok: true, message: who + ' is already ' + lead.status + ', nothing changed.' };
+  }
+  if (req.op === 'nudge') {
+    const tz = lead.tz || s.DEFAULT_TZ;
+    const when = initialSlot_(new Date(), tz, s);
+    update_('Leads', lead._row, { status: 'waiting', next_send_at: when, next_send_local: fmtLocal_(when, tz) });
+    logEvent_(lead, 'nudge_requested', {});
+    const soon = when - new Date() < 3600e3;
+    return { ok: true, message: soon ? 'Follow-up going out within the hour.'
+      : 'Follow-up scheduled for ' + fmtLocal_(when, tz) + ' (' + fmtLocal_(when, 'Asia/Hong_Kong') + ').' };
+  }
+  if (req.op === 'booked' || req.op === 'drop') {
+    const status = req.op === 'booked' ? 'booked' : 'dropped';
+    update_('Leads', lead._row, { status, next_send_at: '', next_send_local: '' });
+    logEvent_(lead, status, { detail: 'via Telegram button' });
+    return { ok: true, message: status === 'booked' ? 'Marked as call booked. No more pings.' : 'Dropped. No more pings or emails.' };
+  }
+  return { ok: false, error: 'unknown op ' + req.op };
 }
 
 function videoId_(url) {
@@ -651,17 +688,17 @@ function tickInner_(forceCheck) {
         Object.assign(lead, patch);
         update_('Leads', lead._row, patch);
       }
-      if (['active', 'finished', 'replied', 'booking'].indexOf(lead.status) >= 0) {
+      if (['active', 'finished', 'replied', 'waiting'].indexOf(lead.status) >= 0) {
         if (lead.status === 'finished' && now - new Date(lead.last_sent_at) > 21 * 864e5) {
           update_('Leads', lead._row, { status: 'done' });
           continue;
         }
-        const sending = (lead.status === 'active' || lead.status === 'booking') && due;
+        const sending = (lead.status === 'active' || lead.status === 'waiting') && due;
         if (!fullCheck && !sending) continue;
         // Only messages newer than the prospect's last known message count.
         const since = new Date(lead.last_prospect_at || (lead.status === 'replied' ? lead.replied_at : '') ||
           lead.first_sent_at).getTime();
-        const msgs = leadMessages_(lead, since, lead.status === 'replied');
+        const msgs = leadMessages_(lead, since, lead.status === 'replied' || lead.status === 'waiting');
         const theirs = msgs.filter(m => !m.mine && !m.auto);
         if (theirs.length) {
           handleProspectMsg_(lead, theirs[theirs.length - 1], s, now);
@@ -670,13 +707,24 @@ function tickInner_(forceCheck) {
         if (lead.status === 'replied') {
           const mine = msgs.filter(m => m.mine);
           if (mine.length) {
-            handleUserReply_(lead, mine[mine.length - 1], s, now);
+            handleUserReply_(lead, mine[mine.length - 1]);
           } else if (!isTrue_(lead.reminded) && now - new Date(lead.replied_at) > s.REPLY_REMINDER_HOURS * 3600e3) {
             update_('Leads', lead._row, { reminded: true });
             notify_(s, '⏰ ' + (lead.first_name || '') + ' (' + lead.company + ') replied ' + s.REPLY_REMINDER_HOURS +
               'h+ ago and is still waiting on you:\n"' + lead.reply_snippet + '"\n' + threadLink_(lead));
           }
           continue;
+        }
+        if (lead.status === 'waiting') {
+          // Your own later emails (manual follow-ups) restart the quiet clock.
+          const mine = msgs.filter(m => m.mine && m.ts > new Date(lead.last_mine_at || 0).getTime());
+          if (mine.length) {
+            const last = mine[mine.length - 1];
+            Object.assign(lead, { last_mine_at: new Date(last.ts), last_msg_id: last.rfcId || lead.last_msg_id });
+            update_('Leads', lead._row, { last_mine_at: lead.last_mine_at, last_msg_id: lead.last_msg_id });
+          }
+          const quietSince = Math.max(new Date(lead.last_mine_at || 0).getTime(), new Date(lead.last_ping_at || 0).getTime());
+          if (fullCheck && !lead.next_send_at && now - quietSince >= s.CHECKIN_PING_DAYS * 864e5) sendCheckin_(lead, s, now);
         }
         if (lead.video_id in views) {
           const v = views[lead.video_id];
@@ -692,11 +740,11 @@ function tickInner_(forceCheck) {
       if (s.PAUSED || budget <= 0 || runBudget <= 0) continue;
       const sendInitial = lead.status === 'test_pending' || (lead.status === 'scheduled' && due);
       const sendFollowup = lead.status === 'active' && due;
-      const sendBooking = lead.status === 'booking' && due;
-      if (!sendInitial && !sendFollowup && !sendBooking) continue;
+      const sendNudge = lead.status === 'waiting' && due;
+      if (!sendInitial && !sendFollowup && !sendNudge) continue;
       if (runBudget < s.MAX_SENDS_PER_RUN) Utilities.sleep(30000 + Math.floor(Math.random() * 60000));
       if (sendInitial) sendInitial_(lead, s);
-      else if (sendBooking) sendBooking_(lead, s);
+      else if (sendNudge) sendNudge_(lead, s);
       else sendFollowup_(lead, s);
       budget--;
       runBudget--;
@@ -717,14 +765,16 @@ function tickInner_(forceCheck) {
 }
 
 // Token/chat normally live in Script Properties (set via the set_telegram action) so they stay out of the sheet.
-function notify_(s, text) {
+function notify_(s, text, replyMarkup) {
   const props = PropertiesService.getScriptProperties();
   const token = s.TELEGRAM_BOT_TOKEN || props.getProperty('TELEGRAM_BOT_TOKEN');
   const chat = s.TELEGRAM_CHAT_ID || props.getProperty('TELEGRAM_CHAT_ID');
   if (!token || !chat) return { ok: false, error: 'telegram not configured' };
   try {
     const res = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
-      method: 'post', payload: { chat_id: String(chat), text, disable_web_page_preview: 'true' }, muteHttpExceptions: true,
+      method: 'post', muteHttpExceptions: true,
+      payload: Object.assign({ chat_id: String(chat), text, disable_web_page_preview: 'true' },
+        replyMarkup ? { reply_markup: JSON.stringify(replyMarkup) } : {}),
     });
     return { ok: res.getResponseCode() === 200, code: res.getResponseCode() };
   } catch (e) {
@@ -733,7 +783,7 @@ function notify_(s, text) {
   }
 }
 
-// Manual correction from Claude: booked / closed (stop), booking (call follow-ups), active (resume the sequence).
+// Manual correction from Claude: booked / closed / dropped (stop), waiting (check-in pings), active (resume the sequence).
 function setStatus_(req) {
   const s = settings_();
   const key = String(req.email || req.lead_id || '').toLowerCase();
@@ -742,11 +792,13 @@ function setStatus_(req) {
   if (!lead) return { ok: false, error: 'lead not found: ' + key };
   const tz = lead.tz || s.DEFAULT_TZ;
   const patch = { status: req.status, next_send_at: '', next_send_local: '' };
-  if (req.status === 'booking' || req.status === 'active') {
-    const next = slot_(new Date(), req.status === 'booking' ? s.BOOKING_GAP_DAYS : s.FOLLOWUP_GAP_DAYS, tz, s);
+  if (req.status === 'waiting') {
+    Object.assign(patch, { last_mine_at: lead.last_mine_at || new Date() });
+  } else if (req.status === 'active') {
+    const next = slot_(new Date(), s.FOLLOWUP_GAP_DAYS, tz, s);
     Object.assign(patch, { next_send_at: next, next_send_local: fmtLocal_(next, tz), errors: 0 });
-  } else if (['booked', 'closed', 'stopped'].indexOf(req.status) < 0) {
-    return { ok: false, error: 'status must be booked, closed, stopped, booking or active' };
+  } else if (['booked', 'closed', 'stopped', 'dropped'].indexOf(req.status) < 0) {
+    return { ok: false, error: 'status must be booked, closed, stopped, dropped, waiting or active' };
   }
   update_('Leads', lead._row, patch);
   logEvent_(lead, 'status_' + req.status, { detail: req.reason || 'set via Claude' });
@@ -1050,7 +1102,7 @@ function dashData_(d) {
   const stepKeys = Object.keys(d.replies_by_step).map(Number);
   const maxStep = Math.max(10, ...stepKeys.filter(k => k < 100));
   for (let i = 0; i <= maxStep; i++) steps.push([i === 0 ? 'First' : 'FU ' + i, d.replies_by_step[i] || 0]);
-  steps.push(['Call FUs', stepKeys.filter(k => k >= 100).reduce((a, k) => a + d.replies_by_step[k], 0)]);
+  steps.push(['Your nudges', stepKeys.filter(k => k >= 100).reduce((a, k) => a + d.replies_by_step[k], 0)]);
 
   return {
     tiles: [['Emailed', n, ''], ['Opened', frac_(opened, n), '%'], ['Clicked', frac_(clicked, n), '%'],
