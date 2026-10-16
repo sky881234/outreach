@@ -164,6 +164,7 @@ function doPost(e) {
       case 'upgrade': return json_(upgrade_());
       case 'set_telegram': return json_(setTelegram_(req));
       case 'set_status': return json_(setStatus_(req));
+      case 'update_lead': return json_(updateLead_(req));
       case 'test_checkin': {
         const l = table_('Leads').rows.find(x => x.lead_id === req.lead_id);
         return json_(l ? notify_(settings_(), '🧪 Test check-in ping for ' + (l.first_name || l.company) +
@@ -497,6 +498,7 @@ function leadMessages_(lead, sinceMs, withSent) {
     out.push({
       ts, mine: (msg.labelIds || []).indexOf('SENT') >= 0, auto: isAuto_(msg), snippet: unescape_(msg.snippet || ''),
       bounce: /mailer-daemon|postmaster/.test(header_(msg, 'From').toLowerCase()), rfcId: header_(msg, 'Message-ID'),
+      from: header_(msg, 'From'),
     });
   };
   if (lead.thread_id) {
@@ -538,8 +540,38 @@ function threadLink_(lead) {
   return 'https://mail.google.com/mail/u/0/#all/' + lead.thread_id;
 }
 
+// Greeting fallbacks used when no real first name was known at send time.
+const PLACEHOLDER_NAME = /^(there|team|friend|all|hi|hello|sir|madam|)$/i;
+
+function displayName_(lead) {
+  return PLACEHOLDER_NAME.test(String(lead.first_name || '').trim()) ? lead.company : lead.first_name + ' (' + lead.company + ')';
+}
+
+// First name from a reply's sign-off ("Many thanks, Johannes"), falling back to the From display name
+// unless that looks like the brand ("White Tee Watches").
+function nameFromReply_(snippet, from, company) {
+  const body = String(snippet).split(/\bOn (Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*,? /)[0];
+  const sign = /\b(?:thanks|thank you|many thanks|cheers|best|regards|best regards|kind regards|warm regards|sincerely|all the best|talk soon)[,.!]?\s+(\w+)\b/gi;
+  let m;
+  let name = '';
+  while ((m = sign.exec(body))) if (/^[A-Z][a-z]+$/.test(m[1])) name = m[1];
+  if (name) return name;
+  const disp = String(from || '').replace(/<.*>/, '').replace(/"/g, '').trim().split(/\s+/);
+  const brand = String(company || '').toLowerCase();
+  return disp.length >= 2 && disp.length <= 3 && /^[A-Z][a-z]+$/.test(disp[0]) &&
+    brand.indexOf(disp[0].toLowerCase()) < 0 ? disp[0] : '';
+}
+
 function handleProspectMsg_(lead, msg, s, now) {
-  const who = (lead.first_name || '') + ' (' + lead.company + ', ' + lead.email + ')';
+  let named = '';
+  if (!msg.bounce && PLACEHOLDER_NAME.test(String(lead.first_name || '').trim())) {
+    named = nameFromReply_(msg.snippet, msg.from, lead.company);
+    if (named) {
+      lead.first_name = named;
+      update_('Leads', lead._row, { first_name: named });
+    }
+  }
+  const who = displayName_(lead) + ', ' + lead.email;
   const step = lead.status === 'waiting' ? 200 + Number(lead.nudges || 0) : lead.step;
   if (msg.bounce) {
     update_('Leads', lead._row, { status: 'bounced', replied_at: now, reply_snippet: msg.snippet, next_send_at: '', next_send_local: '' });
@@ -560,7 +592,8 @@ function handleProspectMsg_(lead, msg, s, now) {
   const next = intent === 'stop' ? 'They asked not to be contacted. Closed: no more emails.'
     : (intent === 'decline' ? 'Looks like a no. ' : '') + 'Automatic follow-ups stopped. Over to you.';
   notify_(s, '📩 Reply from ' + who + ':\n\n"' + msg.snippet + '"\n\n' + after +
-    (isTrue_(lead.seen) ? ', watched the video' : '') + '.\n' + next + '\n' + threadLink_(lead));
+    (isTrue_(lead.seen) ? ', watched the video' : '') + '.\n' + next +
+    (named ? '\nGreeting name set to ' + named + ' from their sign-off.' : '') + '\n' + threadLink_(lead));
 }
 
 // You answered them: wait for their reply, with a check-in ping every CHECKIN_PING_DAYS.
@@ -581,7 +614,7 @@ function checkinButtons_(lead) {
 
 function sendCheckin_(lead, s, now) {
   const days = Math.floor((now - new Date(lead.last_mine_at)) / 864e5);
-  notify_(s, '⏳ ' + (lead.first_name || '') + ' (' + lead.company + ') hasn\'t replied in ' + days + ' days.\n\n' +
+  notify_(s, '⏳ ' + displayName_(lead) + ' hasn\'t replied in ' + days + ' days.\n\n' +
     'They said: "' + lead.reply_snippet + '"\n\n' +
     (Number(lead.nudges) ? 'Follow-ups sent so far: ' + lead.nudges + '\n' : '') + threadLink_(lead),
   checkinButtons_(lead));
@@ -803,6 +836,20 @@ function setStatus_(req) {
   update_('Leads', lead._row, patch);
   logEvent_(lead, 'status_' + req.status, { detail: req.reason || 'set via Claude' });
   return { ok: true, email: lead.email, status: req.status, next_send_local: patch.next_send_local };
+}
+
+// Edit lead details from Claude (e.g. a first name learned later). Only these fields.
+function updateLead_(req) {
+  const allowed = ['first_name', 'company', 'tz', 'topic', 'hook', 'notes'];
+  const key = String(req.email || req.lead_id || '').toLowerCase();
+  const lead = table_('Leads').rows.filter(l =>
+    String(l.email).toLowerCase() === key || String(l.lead_id).toLowerCase() === key).pop();
+  if (!lead) return { ok: false, error: 'lead not found: ' + key };
+  const patch = {};
+  Object.keys(req.fields || {}).filter(k => allowed.indexOf(k) >= 0).forEach(k => { patch[k] = req.fields[k]; });
+  update_('Leads', lead._row, patch);
+  logEvent_(lead, 'edited', { detail: JSON.stringify(patch) });
+  return { ok: true, email: lead.email, updated: patch };
 }
 
 function setSetting_(key, value) {

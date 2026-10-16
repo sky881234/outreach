@@ -16,7 +16,16 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
    - **`thumbnail`**: the play-button thumbnail, usually `output/thumbnail_play.png` or `*Thumbnail_PlayButton*.png`.
 2. **Gather the prospect's details** from the README, the `research/` folder and the channel:
    - Email: from the channel About page, the website or the research files. If you can't find it, ask the user. Never invent one.
-   - First name: the person's name, not the brand.
+   - First name: the person's name, not the brand. Look hard before giving up:
+     - the channel About page and its links
+     - the website's About or Team page
+     - the email address itself (`johannes@...`)
+     - the transcript or description of their videos ("Hi, I'm Johannes")
+     - the research folder
+
+     If it's still unknown, say so plainly in the preview ("⚠️ No first name found: the email will say 'Hey there,'") and ask the user for it, or confirm they're OK with "there", before sending. Never silently use "there".
+     When a prospect replies, the engine replaces a placeholder name ("there", "team", blank) with the name from their sign-off and mentions it in the reply ping.
+     To fix a name later, run `outreach.call({'action':'update_lead','email':X,'fields':{'first_name':'Name'}})`. Allowed fields: `first_name`, `company`, `tz`, `topic`, `hook`, `notes`.
    - Company / channel name.
    - Timezone: an IANA name inferred from their location. If unknown, leave it out and the engine defaults to `America/New_York`.
 3. **Write `<Lead>\outreach\lead.json`** (create the folder):
