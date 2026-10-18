@@ -132,6 +132,10 @@ Out-of-office auto-replies do not stop the sequence.
 - Leads get `opens`, `clicks`, `opened_at` and `clicked_at`. A click marks the lead `seen`.
 - The Stats tab shows open % and click % per template and per touch.
 - Turn tracking off by blanking `TRACKING_URL` in Settings.
+- **Gmail recipients get no tracking by default** (`TRACK_GMAIL` = FALSE). Open data from 2026-10-17 suggested that Gmail-to-Gmail mail with the shared workers.dev links lands in Spam: 11% opens vs 39% at company domains. For those leads, "watched" comes from YouTube views only.
+- Per lead: the `tracking` column (`on` / `off` / blank = rule above). From the CLI: `send ... --tracking on|off`.
+- `MAX_NEW_PER_DAY` (20) caps first emails to new prospects per 24h; extra scheduled ones wait. Follow-ups aren't counted.
+- Deliverability check: `python test\deliverability.py` shows open rates by recipient provider.
 - Worker secrets `SECRET` and `APPS_SCRIPT_URL` must match `config.json`. Set them with `wrangler secret bulk <json file>`. Never pipe them from PowerShell, because the trailing newline breaks the signature check.
 - Test the whole chain with `python test\track_test.py https://watch.matthewto.workers.dev`.
 - Opens are inflated by Apple Mail privacy. Opening the email in your own Sent folder also counts as an open.

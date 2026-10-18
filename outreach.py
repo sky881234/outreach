@@ -103,6 +103,7 @@ def main():
     sd.add_argument("--now", action="store_true")
     sd.add_argument("--test", metavar="EMAIL")
     sd.add_argument("--force", action="store_true")
+    sd.add_argument("--tracking", choices=["on", "off"], help="override open/click tracking for this lead")
     sub.add_parser("status")
     sub.add_parser("run")
     st = sub.add_parser("stop")
@@ -128,7 +129,7 @@ def main():
             res = call({
                 "action": "enqueue", "lead": fields, "thumb_b64": thumb_b64(lead["thumbnail"]),
                 "initial_template": lead.get("initial_template"), "send_now": a.now,
-                "test": bool(a.test), "force": a.force,
+                "test": bool(a.test), "force": a.force, "tracking": a.tracking,
             })
             res["video_url"] = lead["video_url"]
     elif a.cmd == "stop":

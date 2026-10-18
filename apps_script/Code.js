@@ -6,7 +6,7 @@ const SHEETS = {
     'touches', 'tz', 'video_url', 'video_id', 'thumb_file_id', 'initial_template', 'subject', 'thread_id',
     'rfc_msg_id', 'step', 'first_sent_at', 'last_sent_at', 'next_send_at', 'next_send_local', 'last_template',
     'last_touch', 'views_baseline', 'views', 'seen', 'replied_at', 'reply_snippet', 'errors', 'last_error', 'notes', 'opens', 'clicks', 'opened_at', 'clicked_at',
-    'last_prospect_at', 'declined', 'booking_step', 'last_msg_id', 'reminded', 'last_mine_at', 'last_ping_at', 'nudges'],
+    'last_prospect_at', 'declined', 'booking_step', 'last_msg_id', 'reminded', 'last_mine_at', 'last_ping_at', 'nudges', 'tracking'],
   Templates: ['template_id', 'kind', 'branch', 'subject', 'body', 'active', 'notes'],
   Touches: ['touch_id', 'text', 'active'],
   Events: ['ts', 'lead_id', 'email', 'event', 'step', 'template_id', 'touch_id', 'initial_template', 'detail'],
@@ -27,6 +27,8 @@ const DEFAULT_SETTINGS = [
   ['SKIP_WEEKENDS', 'FALSE', 'TRUE = never send on Sat/Sun (prospect time)'],
   ['DEFAULT_TZ', 'America/New_York', 'Used when a lead has no timezone'],
   ['PAUSED', 'FALSE', 'TRUE = stop all sending'],
+  ['TRACK_GMAIL', 'FALSE', 'TRUE = open pixel + tracked link for @gmail.com recipients too (the shared workers.dev links can hurt Gmail inbox placement)'],
+  ['MAX_NEW_PER_DAY', 20, 'First emails to new prospects per 24h (follow-ups not counted); extras wait for the next day'],
   ['TRACKING_URL', '', 'Cloudflare worker for open/click tracking; blank = no tracking'],
   ['TELEGRAM_BOT_TOKEN', '', 'Leave blank: reply alerts are configured privately in Script Properties'],
   ['TELEGRAM_CHAT_ID', '', 'Leave blank unless overriding the alert chat'],
@@ -235,6 +237,8 @@ function settings_() {
   s.DAILY_SEND_CAP = Number(s.DAILY_SEND_CAP);
   s.SKIP_WEEKENDS = String(s.SKIP_WEEKENDS).toUpperCase() === 'TRUE';
   s.PAUSED = String(s.PAUSED).toUpperCase() === 'TRUE';
+  s.TRACK_GMAIL = String(s.TRACK_GMAIL).toUpperCase() === 'TRUE';
+  s.MAX_NEW_PER_DAY = Number(s.MAX_NEW_PER_DAY);
   return s;
 }
 
@@ -374,6 +378,9 @@ function render_(tpl, lead, touch, track) {
 function trackLinks_(lead, step, s) {
   const base = String(s.TRACKING_URL || '').replace(/\/+$/, '');
   if (!base || !lead.lead_id || !lead.video_id) return null;
+  // Per-lead 'on'/'off' wins; blank follows TRACK_GMAIL for Gmail recipients.
+  if (lead.tracking === 'off') return null;
+  if (lead.tracking !== 'on' && !s.TRACK_GMAIL && /@(gmail|googlemail)\.com$/i.test(String(lead.email).trim())) return null;
   const data = lead.lead_id + '.' + step + '.' + lead.video_id;
   const sig = Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(data, SECRET)).slice(0, 12);
   const token = data + '.' + sig;
@@ -705,6 +712,9 @@ function tickInner_(forceCheck) {
   }
 
   let budget = s.DAILY_SEND_CAP - sentLast24h_();
+  const dayAgo = Date.now() - 864e5;
+  let newBudget = s.MAX_NEW_PER_DAY - table_('Events').rows.filter(e =>
+    e.event === 'sent' && String(e.step) === '0' && new Date(e.ts).getTime() > dayAgo).length;
   let runBudget = s.MAX_SENDS_PER_RUN;
   const eng = engagement_(table_('Events').rows);
   for (const lead of leads) {
@@ -775,8 +785,12 @@ function tickInner_(forceCheck) {
       const sendFollowup = lead.status === 'active' && due;
       const sendNudge = lead.status === 'waiting' && due;
       if (!sendInitial && !sendFollowup && !sendNudge) continue;
+      if (sendInitial && lead.status === 'scheduled' && newBudget <= 0) continue;
       if (runBudget < s.MAX_SENDS_PER_RUN) Utilities.sleep(30000 + Math.floor(Math.random() * 60000));
-      if (sendInitial) sendInitial_(lead, s);
+      if (sendInitial) {
+        sendInitial_(lead, s);
+        if (lead.status !== 'test') newBudget--;
+      }
       else if (sendNudge) sendNudge_(lead, s);
       else sendFollowup_(lead, s);
       budget--;
@@ -924,7 +938,7 @@ function enqueue_(req) {
     lead_id: 'L' + Utilities.formatDate(now, 'Asia/Hong_Kong', 'yyMMddHHmmss'), added_at: now,
     status: req.test ? 'test_pending' : 'scheduled', step: 0, initial_template: req.initial_template || '',
     next_send_at: when, next_send_local: fmtLocal_(when, lead.tz), views_baseline: baseline, views: baseline,
-    seen: false, errors: 0,
+    seen: false, errors: 0, tracking: req.tracking === 'on' || req.tracking === 'off' ? req.tracking : '',
   });
   lead._row = append_('Leads', lead);
   if (req.send_now || req.test) sendInitial_(lead, s);
