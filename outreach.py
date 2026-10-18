@@ -13,6 +13,7 @@ import argparse
 import base64
 import io
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +43,31 @@ def thumb_b64(path):
     buf = io.BytesIO()
     im.save(buf, "JPEG", quality=85, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
+
+
+CONTENT_WORDS = re.compile(r"\b(shorts?|videos?|vlogs?|clips?|channel|content|youtube|tutorials?|reviews?)\b", re.I)
+
+
+def topic_problem(lead):
+    """The subject is "Question About {topic}": topic must be what they sell, not their brand or their content."""
+    topic = (lead.get("topic") or "").strip()
+    company = (lead.get("company") or "").strip()
+    if not topic:
+        return "topic is empty"
+    if CONTENT_WORDS.search(topic):
+        return f'topic "{topic}" describes their content; use the product or service they sell'
+    brand = re.split(r"\s+[-|,–]\s*|,", company)[0].strip().lower()
+    first = (brand.split() or [""])[0]
+    t = topic.lower()
+    if (t in company.lower() or (len(brand) >= 4 and brand in t)
+            or (len(first) >= 4 and first not in GENERIC_WORDS and re.search(rf"\b{re.escape(first)}\b", t))):
+        return f'topic "{topic}" is their brand name; use the product or service they sell'
+    return ""
+
+
+# Common words a company name can start with that are also fine inside a product topic.
+GENERIC_WORDS = {"smart", "home", "health", "fitness", "watch", "money", "real", "estate", "plumbing", "heating",
+                 "the", "best", "global", "digital", "mind", "body", "life", "auto", "car", "cars", "pro", "tech"}
 
 
 def lead_fields(lead):
@@ -86,6 +112,10 @@ def main():
     if a.cmd in ("preview", "send"):
         path = Path(a.lead)
         lead = json.loads(path.read_text(encoding="utf-8"))
+        problem = topic_problem(lead)
+        if problem:
+            print(json.dumps({"ok": False, "stage": "topic_check", "error": problem}, indent=2))
+            return 1
         if a.cmd == "preview":
             fields = lead_fields(lead)
             fields.setdefault("video_url", "https://youtube.com/shorts/XXXXXXXXXXX")
