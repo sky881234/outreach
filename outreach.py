@@ -104,6 +104,9 @@ def main():
     sd.add_argument("--test", metavar="EMAIL")
     sd.add_argument("--force", action="store_true")
     sd.add_argument("--tracking", choices=["on", "off"], help="override open/click tracking for this lead")
+    la = sub.add_parser("li-add", help="add a LinkedIn prospect; pings Telegram with the connect note")
+    la.add_argument("li")
+    la.add_argument("--force", action="store_true")
     sub.add_parser("status")
     sub.add_parser("run")
     st = sub.add_parser("stop")
@@ -132,6 +135,17 @@ def main():
                 "test": bool(a.test), "force": a.force, "tracking": a.tracking,
             })
             res["video_url"] = lead["video_url"]
+    elif a.cmd == "li-add":
+        # li.json: first_name, last_name, company, profile_url, topic, note (<=300 chars), msg1,
+        #          video_url (or video + title to upload first)
+        path = Path(a.li)
+        li = json.loads(path.read_text(encoding="utf-8"))
+        if len(li.get("note", "")) > 300:
+            print(json.dumps({"ok": False, "error": f"note is {len(li['note'])} chars; LinkedIn allows 300"}))
+            return 1
+        li = ensure_uploaded(path, li)
+        keys = ["first_name", "last_name", "company", "profile_url", "topic", "note", "msg1", "video_url", "notes"]
+        res = call({"action": "li_enqueue", "li": {k: li[k] for k in keys if k in li}, "force": a.force})
     elif a.cmd == "stop":
         res = call({"action": "stop", "email": a.email})
     else:

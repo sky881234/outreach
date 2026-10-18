@@ -97,6 +97,7 @@ function installTrigger_() {
 // Re-run after code updates: refreshes the trigger, adds new columns and new Settings rows.
 function upgrade_() {
   installTrigger_();
+  liUpgrade_();
   Object.keys(SHEETS).forEach(name => {
     const sh = ss_().getSheetByName(name);
     const want = SHEETS[name];
@@ -146,7 +147,9 @@ function doPost(e) {
   if (req.secret !== SECRET) return json_({ ok: false, error: 'unauthorized' });
   // Tracking hits only append to Events (atomic), so they skip the lock and never wait on a send run.
   // Button taps from Telegram: no lock, so a tap never waits behind a send run.
-  if (req.action === 'lead_action') return json_(leadAction_(req));
+  if (req.action === 'lead_action') {
+    return json_(String(req.lead_id || '').indexOf('LI') === 0 ? liAction_(req) : leadAction_(req));
+  }
   if (req.action === 'track') {
     append_('Events', {
       ts: new Date(), lead_id: req.lead_id, event: req.kind === 'click' ? 'click' : 'open', step: req.step,
@@ -166,7 +169,24 @@ function doPost(e) {
       case 'upgrade': return json_(upgrade_());
       case 'set_telegram': return json_(setTelegram_(req));
       case 'set_status': return json_(setStatus_(req));
+      case 'li_enqueue': return json_(liEnqueue_(req));
+      case 'li_status': return json_({ ok: true, counts: liStatus_() });
+      case 'find_mail': {
+        // Debug/setup helper: latest messages matching a Gmail search (e.g. a forwarding confirmation code).
+        const list = Gmail.Users.Messages.list('me', { q: req.q, maxResults: req.limit || 5 });
+        return json_({ ok: true, messages: (list.messages || []).map(m => {
+          const g = Gmail.Users.Messages.get('me', m.id, { format: 'metadata', metadataHeaders: ['Subject', 'From', 'Date'] });
+          return { from: header_(g, 'From'), subject: header_(g, 'Subject'), date: header_(g, 'Date'), snippet: unescape_(g.snippet || '') };
+        }) });
+      }
       case 'update_lead': return json_(updateLead_(req));
+      case 'test_raw': {
+        // Deliverability probe: one email with arbitrary subject/body to a seed inbox. No lead row, no tracking.
+        const fake = { email: req.to, video_url: '', thumb_file_id: '' };
+        const r = render_({ subject: req.subject, body: req.body }, fake, '', null);
+        const res = send_(fake, r, r.subject, null, null);
+        return json_({ ok: true, id: res.id });
+      }
       case 'test_checkin': {
         const l = table_('Leads').rows.find(x => x.lead_id === req.lead_id);
         return json_(l ? notify_(settings_(), '🧪 Test check-in ping for ' + (l.first_name || l.company) +
@@ -702,6 +722,7 @@ function tickInner_(forceCheck) {
   const s = settings_();
   const props = PropertiesService.getScriptProperties();
   const fullCheck = forceCheck || Date.now() - Number(props.getProperty('LAST_CHECK') || 0) > 55 * 60 * 1000;
+  try { liTick_(fullCheck); } catch (e) { Logger.log('linkedin: ' + e); }
   const leads = table_('Leads').rows.filter(l => ACTIVE_STATES.indexOf(l.status) >= 0 || l.status === 'test_pending');
   const now = new Date();
 
@@ -812,7 +833,7 @@ function tickInner_(forceCheck) {
 }
 
 // Token/chat normally live in Script Properties (set via the set_telegram action) so they stay out of the sheet.
-function notify_(s, text, replyMarkup) {
+function notify_(s, text, replyMarkup, parseMode) {
   const props = PropertiesService.getScriptProperties();
   const token = s.TELEGRAM_BOT_TOKEN || props.getProperty('TELEGRAM_BOT_TOKEN');
   const chat = s.TELEGRAM_CHAT_ID || props.getProperty('TELEGRAM_CHAT_ID');
@@ -821,7 +842,7 @@ function notify_(s, text, replyMarkup) {
     const res = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
       method: 'post', muteHttpExceptions: true,
       payload: Object.assign({ chat_id: String(chat), text, disable_web_page_preview: 'true' },
-        replyMarkup ? { reply_markup: JSON.stringify(replyMarkup) } : {}),
+        replyMarkup ? { reply_markup: JSON.stringify(replyMarkup) } : {}, parseMode ? { parse_mode: parseMode } : {}),
     });
     return { ok: res.getResponseCode() === 200, code: res.getResponseCode() };
   } catch (e) {
@@ -965,7 +986,7 @@ function statusReport_() {
   leads.forEach(l => { by[l.status] = (by[l.status] || 0) + 1; });
   const hk = d => (d ? fmtLocal_(new Date(d), 'Asia/Hong_Kong') : '');
   return {
-    ok: true, counts: by, total: leads.length,
+    ok: true, counts: by, total: leads.length, linkedin: liStatus_(),
     recent: leads.slice(-25).reverse().map(l => ({
       company: l.company, email: l.email, status: l.status, step: l.step, seen: isTrue_(l.seen),
       next_send_hkt: hk(l.next_send_at), replied: l.reply_snippet || '', error: l.last_error || '',

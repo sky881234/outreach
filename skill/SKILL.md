@@ -69,6 +69,41 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
    - This uploads the video first (a Chrome window opens on the PC for 1–3 minutes) and saves `video_url` back into lead.json, so a retry never uploads twice.
    - Reply with the YouTube link, the send time in HKT and in their time zone, and "follow-ups are automatic until they reply".
 
+## LinkedIn flow (user says "send it on LinkedIn" / "LinkedIn this one")
+
+The user presses Send in LinkedIn themselves. Never automate LinkedIn clicks: it violates LinkedIn's terms and risks the account. The engine (`apps_script/LinkedIn.js`, sheet tab **LinkedIn**) times everything and pings Telegram with copy-ready text and buttons.
+
+1. **Find their LinkedIn profile** (`linkedin.com/in/...`) using:
+   - links on their channel About page or website
+   - a web search for their name plus company plus "LinkedIn"
+
+   If you can't find it, or aren't sure it's the same person, ask the user. Never guess.
+2. **Write `<Lead>\outreach\li.json`:**
+   ```json
+   {"first_name":"Wali","last_name":"Khan","company":"Wali Khan","profile_url":"https://www.linkedin.com/in/...",
+    "topic":"1-on-1 Finance Sessions","video_url":"https://youtube.com/shorts/...",
+    "note":"<=300 chars, personal, mentions their actual video, no link>",
+    "msg1":"first message after they accept: personal line about their video + the YouTube link + a soft ask"}
+   ```
+   - It can take `video` and `title` instead of `video_url`, in which case it uploads first.
+   - Premium Career: every connection note can be personalized.
+   - Unique wording per prospect, like email. Show the user `note` and `msg1` before adding.
+3. **Add it:** run `python outreach.py li-add <li.json>`. Telegram immediately gets "🤝 Connect with …" with the note in a tap-to-copy box and buttons ✅ Requested / 🗑 Drop.
+
+**LinkedIn statuses:**
+- `to_connect` → `requested` (button tap).
+- `requested` → `accepted`: LinkedIn's "accepted your invitation" email is detected, or the user taps ✅ They accepted. The first message is then pinged.
+- `accepted` → `messaged`: ✅ Sent.
+- `messaged` → `followup_due`: after `LI_FOLLOWUP_GAP_DAYS` (2), Telegram gets the follow-up text.
+- Follow-ups: up to `LI_MAX_FOLLOWUPS` (4), using Templates kind `li_followup`:
+  - LU1 if they haven't watched the video, LS1 if they have
+  - LC1 (the call ask with the Calendly link) from follow-up `LI_CALL_FROM_STEP` (3) onward
+- Any LinkedIn "sent you a message" email from them, or 💬 They replied, sets `replied` and stops everything.
+- Requests not accepted after `LI_WITHDRAW_DAYS` (21) get one "withdraw it" ping.
+- Pending actions are re-pinged after `LI_REMIND_HOURS` (20).
+
+**Detection:** LinkedIn notifications go to **starkirby922@gmail.com**. A Gmail filter there (from: linkedin.com → forward) sends them to contactmatthew2200, where `liScanNotifications_` reads them hourly and matches on the prospect's full name, or on a unique first name. LinkedIn pings keep running even while email `PAUSED` = TRUE.
+
 ## Other commands (run from `C:\Projects\outreach`)
 
 - `python outreach.py status`: counts, the latest 25 leads (status, step, watched, next send in HKT, reply snippet) and A/B stats. Summarize briefly for Telegram.
