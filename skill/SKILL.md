@@ -1,4 +1,4 @@
-﻿---
+---
 name: send-outreach
 description: Send the cold outreach email for an approved free-value Short and run the follow-up pipeline. Uploads the final video to YouTube as Unlisted, emails the prospect with the play-button thumbnail linked to it at 9am their time, then the Google Apps Script engine follows up every 2 days (up to 10x) until they reply, choosing the "seen"/"not seen" version by whether the video got views. Use when the user approves a video and says "send it", "send the outreach", "send now", or asks about outreach status, replies, who watched, stopping a prospect, test emails, follow-up templates, or A/B results.
 ---
@@ -7,7 +7,7 @@ description: Send the cold outreach email for an approved free-value Short and r
 
 Everything lives in `C:\Projects\outreach\`. The engine is an Apps Script bound to the **Outreach** Google Sheet (account contactmatthew2200@gmail.com). It runs hourly on Google's servers, so follow-ups go out with the PC off. The local side is `outreach.py`, which calls the engine, and `yt_upload.py`, which drives YouTube Studio.
 
-The user's time zone is HKT. Most prospects are in the US. Emails go out at about 9am in the prospect's time zone, roughly 9â€“10pm HKT for the US East Coast.
+The user's time zone is HKT. Most prospects are in the US. Emails go out at about 9am in the prospect's time zone, roughly 9–10pm HKT for the US East Coast.
 
 ## Sending flow (user says "send it" for an approved video)
 
@@ -44,7 +44,16 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
      "title": "8, 9, 10 capsules of magnesium just to poop?! Gut doctor explains"
    }
    ```
-   - **`topic`**: 1â€“3 words naming what they sell or do. It fills the subject line "Question About {topic}".
+   - **`topic`**: fills the subject line "Question About {topic}". It must be the product or service they make money from, in 1–4 words. Find it in:
+     - their channel description: consults, coaching, 1-1 sessions, courses, templates, memberships
+     - their website or store
+     - the links in their videos
+
+     Good examples: "Southeast Asia Relocation Consults", "Google Sheets Templates", "Student Money Coaching", "Kitchen Knives", "eBikes".
+
+     Never use their brand or channel name ("Maroon Money", "Gut Health Gurus"). Never describe their content with words like Shorts, videos, channel, tutorials or reviews ("F1 Verdict Shorts", "Watch Reviews").
+
+     If they truly sell nothing visible, ask the user. `outreach.py` refuses brand-like or content-like topics (`topic_problem`, tested in `test\topic_test.py`).
    - **`hook`**: one plain sentence in the user's voice, "You want more <the customers or result they want>." Keep it under about 15 words, with no hype or flattery.
    - **`touches`**: the touch point for each follow-up, in order (follow-up 1 uses the first line).
      - Each is one sentence about a different problem they likely have, which this service fixes without extra work from them. Base them on the research about their channel.
@@ -57,7 +66,7 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
    - If `duplicate` is true, say so: this prospect was already emailed.
 5. **Wait for the user's go-ahead.** Skip the preview step only if they explicitly said to send without one.
 6. **Send**: run `python C:\Projects\outreach\outreach.py send <lead.json>`. Add `--now` only if they said "send now".
-   - This uploads the video first (a Chrome window opens on the PC for 1â€“3 minutes) and saves `video_url` back into lead.json, so a retry never uploads twice.
+   - This uploads the video first (a Chrome window opens on the PC for 1–3 minutes) and saves `video_url` back into lead.json, so a retry never uploads twice.
    - Reply with the YouTube link, the send time in HKT and in their time zone, and "follow-ups are automatic until they reply".
 
 ## Other commands (run from `C:\Projects\outreach`)
@@ -82,7 +91,7 @@ The user's time zone is HKT. Most prospects are in the US. Emails go out at abou
 | `closed` | They asked to unsubscribe or stop. Closed immediately, no more emails. |
 
 **Check-in pings for `waiting` leads:**
-- Every `CHECKIN_PING_DAYS` (2) of quiet, Telegram gets a ping with three buttons: ðŸ“¨ Send follow-up, ðŸ“… Call booked, ðŸ—‘ Drop. Quiet is counted from the user's last email to them or the last ping.
+- Every `CHECKIN_PING_DAYS` (2) of quiet, Telegram gets a ping with three buttons: 📨 Send follow-up, 📅 Call booked, 🗑 Drop. Quiet is counted from the user's last email to them or the last ping.
 - **Send follow-up** sends the Templates kind `nudge` email (N1, which includes `{booking_link}` = Settings `BOOKING_LINK`, the Calendly link). It goes now if it's inside their morning window, otherwise at their next morning.
 - The user's own manual emails to the prospect restart the 2-day clock.
 - How a tap reaches the engine: the Telegram bridge (`~/.claude/channels/telegram/bridge.mjs`, `handleOutreachCallback`) receives button data `oc|<op>|<lead_id>` and POSTs `lead_action` to the web app, using `C:\Projects\outreach\config.json`.
@@ -108,7 +117,7 @@ Out-of-office auto-replies do not stop the sequence.
   - First email: watched % and reply % per template.
   - Follow-ups and touch lines: replies per send. A reply is credited to the last email sent before it.
   - Replies by step.
-- **Settings tab**: `SEND_HOUR_LOCAL`, `FOLLOWUP_GAP_DAYS` (2), `MAX_FOLLOWUPS` (10), `DAILY_SEND_CAP` (60), `SEND_WINDOW_HOURS` (3, random time 9:00â€“12:00), `MAX_SENDS_PER_RUN` (2), `SKIP_WEEKENDS`, `PAUSED`.
+- **Settings tab**: `SEND_HOUR_LOCAL`, `FOLLOWUP_GAP_DAYS` (2), `MAX_FOLLOWUPS` (10), `DAILY_SEND_CAP` (60), `SEND_WINDOW_HOURS` (3, random time 9:00–12:00), `MAX_SENDS_PER_RUN` (2), `SKIP_WEEKENDS`, `PAUSED`.
 - **Telegram reply alerts** are on. They go to the user's Telegram group via the bridge bot. The token and chat ID are stored in Script Properties, not the sheet, and were set with the `set_telegram` web-app action.
 
 **Dashboard tab** (first tab of the sheet): stat tiles plus native Sheets charts.
