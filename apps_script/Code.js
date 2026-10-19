@@ -169,6 +169,23 @@ function doPost(e) {
       case 'upgrade': return json_(upgrade_());
       case 'set_telegram': return json_(setTelegram_(req));
       case 'set_status': return json_(setStatus_(req));
+      case 'stop_all': {
+        // Cancel every email lead in the given statuses (default: everything that sends automatically).
+        const which = req.statuses || ['scheduled', 'active', 'finished'];
+        const sh = ss_().getSheetByName('Leads');
+        const t = table_('Leads');
+        const col = t.headers.indexOf('status') + 1;
+        const ncol = t.headers.indexOf('next_send_at') + 1;
+        const lcol = t.headers.indexOf('next_send_local') + 1;
+        const hit = t.rows.filter(l => which.indexOf(l.status) >= 0);
+        hit.forEach(l => {
+          sh.getRange(l._row, col).setValue('stopped');
+          sh.getRange(l._row, ncol).setValue('');
+          sh.getRange(l._row, lcol).setValue('');
+        });
+        append_('Events', { ts: new Date(), event: 'stop_all', detail: hit.length + ' leads: ' + which.join(',') });
+        return json_({ ok: true, stopped: hit.length });
+      }
       case 'li_enqueue': return json_(liEnqueue_(req));
       case 'li_status': return json_({ ok: true, counts: liStatus_() });
       case 'find_mail': {
@@ -176,7 +193,9 @@ function doPost(e) {
         const list = Gmail.Users.Messages.list('me', { q: req.q, maxResults: req.limit || 5 });
         return json_({ ok: true, messages: (list.messages || []).map(m => {
           const g = Gmail.Users.Messages.get('me', m.id, { format: 'metadata', metadataHeaders: ['Subject', 'From', 'Date'] });
-          return { from: header_(g, 'From'), subject: header_(g, 'Subject'), date: header_(g, 'Date'), snippet: unescape_(g.snippet || '') };
+          const out = { from: header_(g, 'From'), subject: header_(g, 'Subject'), date: header_(g, 'Date'), snippet: unescape_(g.snippet || '') };
+          if (req.body) out.body = GmailApp.getMessageById(m.id).getPlainBody().slice(0, 3000);
+          return out;
         }) });
       }
       case 'update_lead': return json_(updateLead_(req));
